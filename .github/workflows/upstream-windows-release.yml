@@ -1,0 +1,202 @@
+name: Sync upstream and release Windows
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Stable release version (for example: 3.15.0 or v3.15.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: ${{ vars.UPSTREAM_REPOSITORY || 'zai-org/ZCode' }}
+
+jobs:
+  prepare:
+    name: Prepare release tag
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.prepare.outputs.should_build }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      version: ${{ steps.prepare.outputs.version }}
+      commit: ${{ steps.prepare.outputs.commit }}
+    steps:
+      - name: Check out the latest default branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Resolve and sync release commit
+        id: prepare
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$UPSTREAM_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid UPSTREAM_REPOSITORY: $UPSTREAM_REPOSITORY" >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            if ! upstream_tag="$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest" --jq .tag_name 2>gh-api-error.log)"; then
+              if ! grep -q "HTTP 404" gh-api-error.log; then
+                cat gh-api-error.log >&2
+                exit 1
+              fi
+              upstream_tag=""
+            fi
+            if [[ -z "$upstream_tag" ]]; then
+              echo "The upstream repository has no stable release; nothing to do."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            tag="$upstream_tag"
+          else
+            tag="$MANUAL_VERSION"
+          fi
+
+          if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release version must be a stable SemVer (X.Y.Z or vX.Y.Z): $tag" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          tag="v$version"
+
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >/dev/null 2>&1; then
+            if [[ "$EVENT_NAME" == "schedule" ]]; then
+              echo "Release $tag already exists; nothing to do."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Release $tag already exists." >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists without a release; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
+            git fetch --no-tags upstream "+refs/tags/$upstream_tag:refs/upstream-releases/$tag"
+            upstream_commit="$(git rev-parse "refs/upstream-releases/$tag^{commit}")"
+            git merge --no-edit "$upstream_commit"
+          fi
+
+          npm pkg set "version=$version"
+          git add package.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: release $tag"
+          fi
+
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          commit="$(git rev-parse HEAD)"
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    name: Build Windows x64
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      ZCODE_ENV: production
+      ZCODE_PREVIEW_IDENTITY: "0"
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.14.0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build production Windows installer
+        run: pnpm bundle:desktop -- --os win --arch x64
+
+      - name: Verify package version and installer
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $actualVersion = node -p "require('./package.json').version"
+          if ($actualVersion -ne $env:EXPECTED_VERSION) {
+            throw "Package version $actualVersion does not match $env:EXPECTED_VERSION"
+          }
+
+          $installers = @(Get-ChildItem "packages/desktop/dist" -Filter "*.exe" -File)
+          if ($installers.Count -eq 0) {
+            throw "No Windows installer was produced"
+          }
+          $installers | ForEach-Object { Write-Host $_.FullName }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: zcode-${{ needs.prepare.outputs.tag }}-windows-x64
+          path: packages/desktop/dist/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - prepare
+      - build-windows
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows installer
+        uses: actions/download-artifact@v7
+        with:
+          name: zcode-${{ needs.prepare.outputs.tag }}-windows-x64
+          path: release-assets
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" release-assets/*.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            --target "$RELEASE_COMMIT"
