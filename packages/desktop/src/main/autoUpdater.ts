@@ -2,12 +2,10 @@
 import type { ISettingService } from "@zcode/services";
 import {
   DEFAULT_LOCALE,
-  DEFAULT_ZCODE_ENDPOINT_ORIGIN,
   desktopMenuMessageIds,
   formatDesktopMenuMessage,
   getDesktopMenuMessage,
   PlatformChannels,
-  resolveRuntimeZCodeEndpointOrigin,
   ZCODE_VERSION,
   type ElectronReleaseChannel,
   type Locale,
@@ -19,13 +17,13 @@ import { app, BrowserWindow, ipcMain, Menu } from "electron";
 import pkg, { CancellationToken } from "electron-updater";
 import semver from "semver";
 import { logger } from "./logger.js";
-import { getElectronReleasePlatform, ManifestUpdateProvider } from "./manifestUpdateProvider.js";
 const { autoUpdater } = pkg;
+
+const GITHUB_UPDATE_OWNER = "railzen";
+const GITHUB_UPDATE_REPOSITORY = "ZCode";
 
 export const CHECK_FOR_UPDATE_MENU_ID = "check-for-update";
 const AUTO_UPDATE_POLL_INTERVAL_MS = 60 * 60 * 1000;
-const UPDATE_FEED_URL_ENV = "ZCODE_UPDATE_FEED_URL";
-const UPDATE_FEED_URL_SWITCH = "--zcode-update-feed-url";
 const DEV_AUTO_UPDATE_ENV = "ZCODE_AUTO_UPDATE_DEV";
 const DEV_AUTO_UPDATE_SWITCH = "--zcode-auto-update-dev";
 const DEV_AUTO_UPDATE_VERSION_ENV = "ZCODE_AUTO_UPDATE_DEV_VERSION";
@@ -50,7 +48,7 @@ let downloadingUpdateReleaseNotes: PostUpdateReleaseNotesPayload | null = null;
 let downloadingUpdateChannel: ElectronReleaseChannel | null = null;
 let downloadCancellationToken: CancellationToken | null = null;
 let readyUpdateChannel: ElectronReleaseChannel | null = null;
-let pendingManifestReleaseChannelRefresh: ElectronReleaseChannel | null = null;
+let pendingReleaseChannelRefresh: ElectronReleaseChannel | null = null;
 let onBeforeQuitAndInstall: (() => void | Promise<void>) | undefined;
 const acknowledgedPostUpdateReleaseNotesVersions = new Set<string>();
 const cancelledDownloadTokens = new WeakSet<CancellationToken>();
@@ -91,8 +89,6 @@ type UpdateDownloadedInfoLike = {
   > | null;
 };
 
-type RuntimeUpdateFeedSource = { url: string };
-
 type AutoUpdaterMenuState = UpdateStatePayload;
 let menuState: AutoUpdaterMenuState = { kind: "idle", enabled: true };
 
@@ -113,9 +109,6 @@ interface InitAutoUpdaterOptions {
   onBeforeQuitAndInstall?: () => void | Promise<void>;
   settingService?: SettingServiceLike;
   locale?: Locale;
-  updateFeedSource?: RuntimeUpdateFeedSource;
-  deviceMid?: string;
-  resolveEndpointOrigin?: () => string | Promise<string>;
 }
 
 let quitAndInstallInFlight = false;
@@ -265,12 +258,12 @@ function completeAutoUpdateCheck(reason: string, checkId: number | null): void {
   activeAutoUpdateCheckChannel = null;
   settlingAutoUpdateCheckId = null;
 
-  const pendingChannel = pendingManifestReleaseChannelRefresh;
+  const pendingChannel = pendingReleaseChannelRefresh;
   if (!pendingChannel) {
     return;
   }
 
-  pendingManifestReleaseChannelRefresh = null;
+  pendingReleaseChannelRefresh = null;
   refreshAutoUpdaterReleaseChannel(
     pendingChannel === "preview",
     `${reason} pending release channel refresh`,
@@ -455,7 +448,7 @@ async function quitAndInstallUpdate(rejectUnavailable = false) {
 
   try {
     if (shouldRelaunchForDevAutoUpdateInstall()) {
-      // 开发态只用于验证服务端 manifest、下载进度和安装入口 UI 闭环，
+      // 开发态只用于验证 GitHub Release 元数据、下载进度和安装入口 UI 闭环，
       // 未打包应用没有可被安装器接管的真实发布包上下文。这里改为重启当前 dev app，
       // 避免点击“重启以更新”执行退出准备后停在无响应状态。
       logger.info("[auto-update] dev update install fallback: relaunch app");
@@ -656,64 +649,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
 }
 
-function redactUpdateFeedUrlForLog(value: string): string {
-  try {
-    const url = new URL(value);
-    url.username = "";
-    url.password = "";
-    if (url.search) {
-      url.search = "?<redacted>";
-    }
-    url.hash = "";
-    return url.toString();
-  } catch {
-    return "<invalid-url>";
-  }
-}
-
-function readSwitchValue(argv: readonly string[], switchName: string): string | undefined {
-  const equalsPrefix = `${switchName}=`;
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (!arg) {
-      continue;
-    }
-    if (arg.startsWith(equalsPrefix)) {
-      return arg.slice(equalsPrefix.length).trim() || undefined;
-    }
-    if (arg === switchName) {
-      const next = argv[index + 1];
-      if (next && !next.startsWith("--")) {
-        return next.trim() || undefined;
-      }
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
-export function resolveUpdateFeedSourceFromStartupConfig(
-  options: {
-    argv?: readonly string[];
-    env?: Record<string, string | undefined>;
-  } = {},
-): RuntimeUpdateFeedSource | undefined {
-  const argv = options.argv ?? process.argv;
-  const env = options.env ?? process.env;
-  const feedUrl = readSwitchValue(argv, UPDATE_FEED_URL_SWITCH) ?? env[UPDATE_FEED_URL_ENV]?.trim();
-  if (!feedUrl) {
-    return undefined;
-  }
-  // 更新源覆盖仅供开发构建联调;正式包按 isPackaged 忽略,避免更新请求被环境变量/启动参数改道
-  if (app.isPackaged) {
-    logger.warn(
-      `[auto-update] ignore update feed override in packaged app: ${redactUpdateFeedUrlForLog(feedUrl)}`,
-    );
-    return undefined;
-  }
-  return { url: feedUrl };
-}
-
 async function resolveUpdateReleaseChannel(
   settingService: SettingServiceLike | undefined,
 ): Promise<ElectronReleaseChannel> {
@@ -745,32 +680,22 @@ async function syncAutoUpdateCheckChannelFromSettings(
       `[auto-update] ${reason}: check channel ${availableUpdateChannel} -> ${nextChannel}`,
     );
   }
-  // 服务端 manifest provider 会在 checkForUpdates 内部读取 preview 设置。
-  // 如果 begin 阶段仍用默认 stable 作为 expected channel，冷启动 preview 结果会被误判为 stale。
+  // GitHub provider 在 checkForUpdates 时读取 allowPrerelease；必须与本轮 generation 的
+  // expected channel 一起更新，避免冷启动 preview 结果被误判成 stable。
+  autoUpdater.allowPrerelease = nextChannel === "preview";
   availableUpdateChannel = nextChannel;
   activeAutoUpdateCheckChannel = nextChannel;
 }
 
-function applyManifestUpdateProvider(options: InitAutoUpdaterOptions): void {
-  const manifestUrl = options.updateFeedSource?.url.trim();
+function applyGitHubUpdateProvider(): void {
   autoUpdater.setFeedURL({
-    provider: "custom",
-    updateProvider: ManifestUpdateProvider,
-    endpointOrigin: DEFAULT_ZCODE_ENDPOINT_ORIGIN,
-    ...(manifestUrl ? { manifestUrl } : {}),
-    releasePlatform: getElectronReleasePlatform(),
-    deviceMid: options.deviceMid,
-    resolveEndpointOrigin:
-      options.resolveEndpointOrigin ?? (() => resolveRuntimeZCodeEndpointOrigin(process.env)),
-    resolveReleaseChannel: async () => {
-      availableUpdateChannel = await resolveUpdateReleaseChannel(options.settingService);
-      return availableUpdateChannel;
-    },
+    provider: "github",
+    owner: GITHUB_UPDATE_OWNER,
+    repo: GITHUB_UPDATE_REPOSITORY,
+    releaseType: "release",
   });
   logger.info(
-    manifestUrl
-      ? `[auto-update] service manifest provider applied platform=${getElectronReleasePlatform()} manifestUrl=${redactUpdateFeedUrlForLog(manifestUrl)}`
-      : `[auto-update] service manifest provider applied platform=${getElectronReleasePlatform()}`,
+    `[auto-update] GitHub Releases provider applied repository=${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPOSITORY}`,
   );
 }
 
@@ -1005,7 +930,7 @@ function handleAutoUpdateFailure(error: unknown, source: string) {
     readyUpdateVersion &&
     isDevSquirrelReadyError(error)
   ) {
-    // 开发态验证真实测试环境 manifest 时，macOS Squirrel 仍可能在
+    // 开发态验证真实 GitHub Release 时，macOS Squirrel 仍可能在
     // update-downloaded 后补一个 code=2 staging 错误。生产包必须清掉失败的 ready，
     // 但开发态需要保留 ready 状态来验证“重启以更新”交互闭环。
     logger.warn(
@@ -1262,7 +1187,7 @@ function cancelDownloadingUpdate(reason = "renderer") {
     `[auto-update] ${reason}: cancel download channel=${channel} version=${version ?? "unknown"}`,
   );
 
-  // 取消下载不是跳过版本，只回退到发现更新状态，保留同一份 manifest 信息让用户可以稍后重试。
+  // 取消下载不是跳过版本，只回退到发现更新状态，保留同一份 Release 信息让用户可以稍后重试。
   clearDownloadingUpdateState();
   if (version) {
     availableUpdateReleaseNotes = releaseNotes;
@@ -1368,8 +1293,8 @@ export function refreshAutoUpdaterReleaseChannel(
   if (checkForUpdatesInFlight) {
     // 用户可能在启动检查尚未完成时切换 preview 开关。
     // 不能立刻改 availableUpdateChannel，否则旧请求返回时会把旧通道的版本标成新通道；
-    // 这里只记录待刷新通道，等当前 check 收口后再重新请求 manifest。
-    pendingManifestReleaseChannelRefresh = nextChannel;
+    // 这里只记录待刷新通道，等当前 check 收口后再重新请求 GitHub Release。
+    pendingReleaseChannelRefresh = nextChannel;
     logger.info(
       `[auto-update] defer ${reason}: check already in flight, next channel=${nextChannel}`,
     );
@@ -1383,8 +1308,9 @@ export function refreshAutoUpdaterReleaseChannel(
   }
 
   logger.info(
-    `[auto-update] ${reason}: refresh manifest channel ${currentChannel} -> ${nextChannel}`,
+    `[auto-update] ${reason}: refresh GitHub release channel ${currentChannel} -> ${nextChannel}`,
   );
+  autoUpdater.allowPrerelease = nextChannel === "preview";
   availableUpdateChannel = nextChannel;
   clearAvailableUpdateState();
   setAutoUpdaterMenuState({ kind: "checking", enabled: false });
@@ -1486,7 +1412,7 @@ export async function initAutoUpdater(options: InitAutoUpdaterOptions = {}): Pro
   activeAutoUpdateCheckId = null;
   activeAutoUpdateCheckChannel = null;
   settlingAutoUpdateCheckId = null;
-  pendingManifestReleaseChannelRefresh = null;
+  pendingReleaseChannelRefresh = null;
   devAutoUpdateVersionOverride = null;
   availableUpdateChannel = "stable";
   clearAvailableUpdateState();
@@ -1499,12 +1425,13 @@ export async function initAutoUpdater(options: InitAutoUpdaterOptions = {}): Pro
   // 再决定是否下载。若继续让 electron-updater 自动下载，它只会按当前 app 版本判断，
   // 导致 `3.1.2` 已 ready `3.1.3` 时每次轮询都可能重复下载 `3.1.3`。
   autoUpdater.autoDownload = false;
+  autoUpdater.allowPrerelease = false;
   // Windows/NSIS 在窗口关闭后会异步启动安装；如果用户紧接着关机，安装器可能被系统中断，
   // 留下半更新状态并导致下次启动失败。
   // 这里仅在 Windows 关闭“退出即自动安装”，要求用户显式点更新；其他平台保持原有行为，避免改动既有升级链路。
   autoUpdater.autoInstallOnAppQuit = process.platform !== "win32";
   autoUpdater.logger = logger;
-  applyManifestUpdateProvider(options);
+  applyGitHubUpdateProvider();
 
   const triggerCheckForUpdates = (reason: string) => {
     if (checkForUpdatesInFlight) {
@@ -1549,7 +1476,7 @@ export async function initAutoUpdater(options: InitAutoUpdaterOptions = {}): Pro
     logger.info(`[auto-update] new version available: ${info.version}`);
     const infoChannel = readUpdateInfoReleaseChannel(info);
     if (shouldIgnoreStaleAvailableUpdate(infoChannel)) {
-      // 用户切换“接收 preview 版本”时，旧通道的 manifest 请求可能晚于新请求返回。
+      // 用户切换“接收 preview 版本”时，旧通道的 GitHub 请求可能晚于新请求返回。
       // 旧结果如果继续写 menuState，或提前结束当前 generation，会让独立更新弹窗继续显示旧版本/旧 release notes。
       logger.info(
         `[auto-update] ignore stale update channel=${infoChannel} expected=${activeAutoUpdateCheckChannel ?? availableUpdateChannel} version=${info.version}`,
@@ -1586,7 +1513,7 @@ export async function initAutoUpdater(options: InitAutoUpdaterOptions = {}): Pro
       if (readyUpdateRestoredFromPendingReleaseNotes) {
         // pendingPostUpdateReleaseNotes 只能证明“曾经下载完成并持久化了版本说明”，
         // 不能恢复当前进程里的 electron-updater downloadedUpdateHelper、Squirrel.Mac proxy server
-        // 或 native staged update。遇到 manifest 再次确认同版本可用时必须清掉伪 ready，
+        // 或 native staged update。GitHub 再次确认同版本可用时必须清掉伪 ready，
         // 重新 downloadUpdate，让缓存命中/重新下载后的 update-downloaded 建立真实安装上下文。
         clearReadyUpdateState();
       }

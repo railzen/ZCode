@@ -163,13 +163,20 @@ jobs:
           if ($installers.Count -eq 0) {
             throw "No Windows installer was produced"
           }
+          $channelFile = "packages/desktop/dist/latest.yml"
+          if (-not (Test-Path -LiteralPath $channelFile -PathType Leaf)) {
+            throw "latest.yml was not produced"
+          }
           $installers | ForEach-Object { Write-Host $_.FullName }
+          Write-Host $channelFile
 
-      - name: Upload Windows installer
+      - name: Upload Windows update assets
         uses: actions/upload-artifact@v7
         with:
           name: zcode-${{ needs.prepare.outputs.tag }}-windows-x64
-          path: packages/desktop/dist/*.exe
+          path: |
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/latest.yml
           if-no-files-found: error
           retention-days: 7
 
@@ -181,7 +188,7 @@ jobs:
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download Windows installer
+      - name: Download Windows update assets
         uses: actions/download-artifact@v7
         with:
           name: zcode-${{ needs.prepare.outputs.tag }}-windows-x64
@@ -195,7 +202,7 @@ jobs:
           RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
-          gh release create "$RELEASE_TAG" release-assets/*.exe \
+          gh release create "$RELEASE_TAG" release-assets/*.exe release-assets/latest.yml \
             --repo "$GITHUB_REPOSITORY" \
             --title "$RELEASE_TAG" \
             --generate-notes \
