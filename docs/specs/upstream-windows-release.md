@@ -4,7 +4,7 @@
 
 仓库通过同一个 GitHub Actions workflow 维护 Windows x64 正式安装包：
 
-- 每天检查 `UPSTREAM_REPOSITORY` 指向仓库的最新正式 Release；本仓库尚未发布该 Tag 时，将该 Release 对应提交合并到本仓库默认分支，以相同版本创建 Tag、构建安装包并创建 Release。
+- 每天检查 `UPSTREAM_REPOSITORY` 指向仓库的最新稳定 SemVer Tag；本仓库尚未发布该 Tag 时，将该 Tag 对应提交合并到本仓库默认分支，以相同版本创建 Tag、构建安装包并创建 Release。
 - 手动运行时必须输入稳定 SemVer。流程基于本仓库默认分支最新提交更新根 `package.json` 版本，创建发布提交和 Tag，再构建并创建 Release。
 - 只构建 `ZCODE_ENV=production` 且 `ZCODE_PREVIEW_IDENTITY=0` 的 Windows x64 NSIS 安装包，并发布 `.exe` 和 GitHub 更新检查必需的 `latest.yml`。
 
@@ -14,7 +14,7 @@
 
 - GitHub 默认分支、Git Tag 和 Release 是发布状态的唯一事实来源；workflow 不维护额外版本缓存。
 - 根 `package.json` 是安装包版本的唯一源码来源。准备阶段必须先把它写成去掉 `v` 前缀的目标版本，再创建 Tag。
-- 上游最新版本只通过 GitHub Releases API 的 `releases/latest` 获取，因此 draft 和 prerelease 不进入自动发布。
+- 上游最新版本只通过 `git ls-remote --tags` 读取 Git Tag，因此不依赖上游是否已创建 GitHub Release。候选 Tag 必须是稳定 SemVer `X.Y.Z` 或 `vX.Y.Z`；带 prerelease/build metadata 的 Tag 不进入自动发布。若存在多个稳定 Tag，取 SemVer 最高者。
 - 本仓库 Release Tag 是幂等键。同名 Release 已存在时自动任务无副作用；同名 Tag 存在但 Release 不存在时拒绝覆盖。
 
 ## 事件顺序
@@ -29,8 +29,8 @@ sequenceDiagram
 
     Trigger->>Prepare: start
     alt daily schedule
-        Prepare->>Prepare: resolve latest stable upstream Release
-        Prepare->>Git: merge upstream release commit
+        Prepare->>Prepare: resolve highest stable upstream Tag
+        Prepare->>Git: merge upstream tag commit
     else manual dispatch
         Prepare->>Git: use latest default-branch commit
     end
@@ -45,16 +45,16 @@ sequenceDiagram
 
 ## 失败语义
 
-- 上游没有正式 Release：自动任务正常结束且不写入任何状态。
+- 上游没有稳定 SemVer Tag：自动任务正常结束且不写入任何状态。
 - 输入版本不是 `X.Y.Z` 或带前缀的 `vX.Y.Z`：手动任务失败，不允许 prerelease/build metadata。
 - 上游仓库格式无效、合并冲突、目标 Tag 已存在、分支保护拒绝推送、构建或上传失败：任务失败，不覆盖已有 Tag 或 Release。
 - Release 和 Tag 只在安装包构建并上传成功后创建，因此失败构建不会留下空 Release 或无包 Tag；已同步的分支提交可供后续任务重试。
 
 ## 验收场景
 
-1. 上游出现新的稳定 Release，本仓库没有同名 Tag/Release：默认分支合并上游提交，安装包成功后在该构建 commit 创建 Tag，Tag 和安装包版本相同，Release 包含 Windows x64 `.exe` 和 `latest.yml`。
-2. 定时任务再次看到已同步的 Release：准备任务输出 `should_build=false`，不构建、不推送。
-3. 上游只有 prerelease 或 draft：不会触发自动发布。
+1. 上游出现新的稳定 Tag（即使尚未创建 GitHub Release），本仓库没有同名 Tag/Release：默认分支合并上游提交，安装包成功后在该构建 commit 创建 Tag，Tag 和安装包版本相同，Release 包含 Windows x64 `.exe` 和 `latest.yml`。
+2. 定时任务再次看到已同步的 Tag：准备任务输出 `should_build=false`，不构建、不推送。
+3. 上游最新 Tag 带 prerelease/build metadata，或没有任何稳定 SemVer Tag：不会触发自动发布。
 4. 手动输入 `3.15.0` 或 `v3.15.0`：根版本均为 `3.15.0`，Tag 均为 `v3.15.0`。
 5. 手动输入 `3.15.0-rc.1` 或已存在 Tag：在任何覆盖操作前失败。
 

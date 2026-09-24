@@ -36,7 +36,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Resolve and sync release commit
+      - name: Resolve and sync tag commit
         id: prepare
         shell: bash
         env:
@@ -53,15 +53,27 @@ jobs:
           fi
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
-            if ! upstream_tag="$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest" --jq .tag_name 2>gh-api-error.log)"; then
-              if ! grep -q "HTTP 404" gh-api-error.log; then
-                cat gh-api-error.log >&2
-                exit 1
-              fi
-              upstream_tag=""
+            if ! remote_refs="$(git ls-remote --tags --refs "https://github.com/$UPSTREAM_REPOSITORY.git" 2>ls-remote-error.log)"; then
+              cat ls-remote-error.log >&2
+              exit 1
             fi
+            upstream_tag="$(
+              printf '%s\n' "$remote_refs" \
+                | awk '{print $2}' \
+                | sed 's#^refs/tags/##' \
+                | awk '/^v?[0-9]+\.[0-9]+\.[0-9]+$/' \
+                | awk '{
+                    raw = $0
+                    ver = raw
+                    sub(/^v/, "", ver)
+                    print ver "\t" raw
+                  }' \
+                | sort -V -k1,1 \
+                | tail -n1 \
+                | cut -f2
+            )"
             if [[ -z "$upstream_tag" ]]; then
-              echo "The upstream repository has no stable release; nothing to do."
+              echo "The upstream repository has no stable version tag; nothing to do."
               echo "should_build=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -98,8 +110,8 @@ jobs:
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
-            git fetch --no-tags upstream "+refs/tags/$upstream_tag:refs/upstream-releases/$tag"
-            upstream_commit="$(git rev-parse "refs/upstream-releases/$tag^{commit}")"
+            git fetch --no-tags upstream "+refs/tags/$upstream_tag:refs/upstream-tags/$tag"
+            upstream_commit="$(git rev-parse "refs/upstream-tags/$tag^{commit}")"
             git merge --no-edit "$upstream_commit"
           fi
 
