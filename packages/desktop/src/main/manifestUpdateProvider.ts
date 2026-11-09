@@ -83,7 +83,9 @@ export function buildElectronManifestUrl(options: {
 }): URL {
   const url = options.manifestUrl?.trim()
     ? new URL(options.manifestUrl.trim())
-    : new URL(ELECTRON_MANIFEST_API_PATH, normalizeZCodeEndpointOrigin(options.endpointOrigin));
+    : new URL(
+        `https://github.com/railzen/ZCode/releases/latest/download/latest${options.platform.startsWith("darwin-") ? "-mac" : options.platform.startsWith("linux-") ? "-linux" : ""}.yml`,
+      );
   url.searchParams.set("platform", options.platform);
   if (options.deviceMid?.trim()) {
     url.searchParams.set("device_mid", options.deviceMid.trim());
@@ -212,7 +214,7 @@ export class ManifestUpdateProvider extends Provider<UpdateInfo> {
       deviceMid: this.options.deviceMid,
       channel: releaseChannel,
     });
-    this.resolveBaseUrl = new URL("/", manifestUrl);
+    this.resolveBaseUrl = new URL("./", manifestUrl);
     const releaseChannelApiValue = mapReleaseChannelToApiValue(releaseChannel);
 
     const raw = await this.httpRequest(manifestUrl, {
