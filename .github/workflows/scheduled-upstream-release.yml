@@ -1,0 +1,13 @@
+name: Daily upstream release check
+
+on:
+  schedule:
+    - cron: "37 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: ./.github/workflows/release-upstream.yml

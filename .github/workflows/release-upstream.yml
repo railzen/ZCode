@@ -1,0 +1,136 @@
+name: Build latest upstream release
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-desktop-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      ZCODE_ENV: production
+      # 开源构建默认关闭更新，必须在编译前显式启用并随产物写入。
+      ZCODE_AUTO_UPDATE: "1"
+      ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sync latest upstream tag and retain fork customizations
+        id: source
+        run: node scripts/ci/upstream-release.mjs sync "${{ github.workspace }}/build-source"
+
+      - name: Check existing release
+        id: existing
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (release && !release.draft) {
+              const assets = await github.paginate(github.rest.repos.listReleaseAssets, {
+                ...context.repo, release_id: release.id, per_page: 100
+              });
+              const names = new Set(assets.filter(a => a.size > 0).map(a => a.name));
+              const installers = [...names].filter(n => n.endsWith('.exe'));
+              if (release.prerelease || !names.has('latest.yml') || !installers.length ||
+                  installers.some(n => !names.has(`${n}.blockmap`))) {
+                throw new Error('Published release is incomplete; inspect it before retrying');
+              }
+              core.setOutput('skip', 'true');
+              core.notice(`Already published: ${release.html_url}`);
+            }
+
+      - name: Install pnpm pinned by synced source
+        if: steps.existing.outputs.skip != 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: build-source/package.json
+          run_install: false
+
+      - name: Install Node pinned by synced mise.toml
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.source.outputs.node }}
+
+      - name: Install dependencies
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: ${{ github.workspace }}/build-source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build desktop and runtime assets
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: ${{ github.workspace }}/build-source
+        run: pnpm build:bootstrap
+
+      - name: Package Windows x64 installer and update metadata
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: ${{ github.workspace }}/build-source
+        run: pnpm bundle:desktop -- --os win --arch x64 --skip-build
+
+      - name: Verify update manifest and assets
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: ${{ github.workspace }}/build-source
+        env:
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: node scripts/ci/upstream-release.mjs validate packages/desktop/dist "$env:RELEASE_TAG"
+
+      - name: Keep build artifacts
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-${{ steps.source.outputs.tag }}
+          if-no-files-found: error
+          path: |
+            ${{ github.workspace }}/build-source/packages/desktop/dist/*.exe
+            ${{ github.workspace }}/build-source/packages/desktop/dist/*.exe.blockmap
+            ${{ github.workspace }}/build-source/packages/desktop/dist/latest.yml
+
+      - name: Upload draft assets and publish complete release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.source.outputs.upstream }}
+          FORK_SHA: ${{ steps.source.outputs.fork }}
+          DIST: ${{ github.workspace }}/build-source/packages/desktop/dist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseJson = gh release view $env:RELEASE_TAG --json isDraft 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $notes = "Upstream: zai-org/ZCode@$env:UPSTREAM_SHA`nFork customizations: $env:GH_REPO@$env:FORK_SHA`nWindows x64; unsigned community build."
+            $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+            Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8
+            gh release create $env:RELEASE_TAG --draft --target $env:FORK_SHA --title "ZCode $env:RELEASE_TAG" --notes-file $notesFile
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create draft release' }
+          } elseif (-not ($releaseJson | ConvertFrom-Json).isDraft) {
+            throw 'Refusing to overwrite a published release'
+          }
+          $assets = Get-Content -LiteralPath (Join-Path $env:DIST 'release-assets.txt')
+          foreach ($asset in $assets) {
+            gh release upload $env:RELEASE_TAG (Join-Path $env:DIST $asset) --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not upload $asset" }
+          }
+          gh release edit $env:RELEASE_TAG --draft=false --prerelease=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Could not publish release' }
