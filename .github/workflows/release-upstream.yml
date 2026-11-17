@@ -75,7 +75,7 @@ jobs:
       - name: Install dependencies
         if: steps.existing.outputs.skip != 'true'
         working-directory: ${{ github.workspace }}/build-source
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --child-concurrency=1
 
       - name: Build desktop and runtime assets
         if: steps.existing.outputs.skip != 'true'
