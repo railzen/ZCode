@@ -39,7 +39,7 @@ export function extractPrebuiltArchive({ archivePath, archiveExt, extractDir, cw
   mkdirSync(extractDir, { recursive: true });
   if (archiveExt === "zip") {
     if (process.platform === "win32") {
-      runCommand("powershell.exe", [
+      runCommand("pwsh.exe", [
         "-NoProfile",
         "-NonInteractive",
         "-ExecutionPolicy",
