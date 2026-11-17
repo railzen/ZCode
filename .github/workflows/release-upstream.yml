@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 120
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
