@@ -82,6 +82,16 @@ jobs:
         working-directory: ${{ github.workspace }}/build-source
         run: pnpm build:bootstrap
 
+      - name: Use PowerShell 7 for archive extraction
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          # 避免 powershell.exe 加载 PowerShell 7 解压模块时发生 .NET 接口不兼容。
+          $file = Join-Path $env:GITHUB_WORKSPACE 'build-source/scripts/prebuilt-binary-extract.mjs'
+          $content = Get-Content -LiteralPath $file -Raw
+          $content = $content.Replace('"powershell.exe"', '"pwsh.exe"')
+          Set-Content -LiteralPath $file -Value $content -Encoding utf8
+
       - name: Package Windows x64 installer and update metadata
         if: steps.existing.outputs.skip != 'true'
         working-directory: ${{ github.workspace }}/build-source
