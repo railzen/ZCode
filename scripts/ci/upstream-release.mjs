@@ -26,8 +26,8 @@ export function makeForkPatchArgs(base, fork) {
   return ["diff", "--binary", "--full-index", base, fork, "--", ".", ":(exclude).github"];
 }
 
-async function git(cwd, args) {
-  const result = await exec("git", args, { cwd, maxBuffer: 128 * 1024 * 1024 });
+async function git(cwd, args, env = process.env) {
+  const result = await exec("git", args, { cwd, env, maxBuffer: 128 * 1024 * 1024 });
   return result.stdout;
 }
 
@@ -45,6 +45,63 @@ export async function applyForkChanges({ root, source, base, fork, upstream, pat
     // 三方应用保留 fork 定制；冲突必须显式失败，不能回退为纯上游构建。
     await git(source, ["apply", "--3way", "--index", patchPath]);
   }
+  // 构建目录以后会推回 main，不能把上游工作流覆盖到 fork 的发布工作流上。
+  await git(source, ["restore", `--source=${fork}`, "--staged", "--worktree", "--", ".github"]);
+}
+
+export async function snapshotSource({ source, fork, upstream, tag }) {
+  if (!stableTag.test(tag)) throw new Error("Invalid stable release tag");
+  // 必须在安装与编译前固定源码；后续构建生成的文件不进入同步提交。
+  await git(source, ["add", "--update"]);
+  const tree = (await git(source, ["write-tree"])).trim();
+  const forkTree = (await git(source, ["rev-parse", `${fork}^{tree}`])).trim();
+  const containsUpstream = await git(source, ["merge-base", "--is-ancestor", upstream, fork])
+    .then(() => true, () => false);
+  if (tree === forkTree && containsUpstream) {
+    await git(source, ["checkout", "--detach", fork]);
+    return fork;
+  }
+  const parents = ["-p", fork, ...(!containsUpstream ? ["-p", upstream] : [])];
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "github-actions[bot]",
+    GIT_AUTHOR_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
+    GIT_COMMITTER_NAME: "github-actions[bot]",
+    GIT_COMMITTER_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com",
+  };
+  const commit = (await git(source, ["-c", "commit.gpgsign=false", "commit-tree", tree,
+    ...parents, "-m", `Sync upstream ${tag} and retain fork customizations`], env)).trim();
+  await git(source, ["checkout", "--detach", commit]);
+  return commit;
+}
+
+export async function pushVerifiedSource({ source, fork, commit, tag, published = false,
+  remote = "origin" }) {
+  if (!stableTag.test(tag)) throw new Error("Invalid stable release tag");
+  await git(source, ["merge-base", "--is-ancestor", fork, commit]);
+  const env = { ...process.env };
+  if (env.GH_TOKEN) {
+    // 凭据仅传给 Git 子进程，不写入磁盘或命令行参数。
+    env.GIT_CONFIG_COUNT = "1";
+    env.GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader";
+    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${env.GH_TOKEN}`).toString("base64")}`;
+  }
+  const refs = await git(source, ["ls-remote", remote, "refs/heads/main", `refs/tags/${tag}`], env);
+  const refMap = new Map(refs.trim().split(/\r?\n/).filter(Boolean).map((line) => {
+    const [sha, name] = line.split(/\s+/);
+    return [name, sha];
+  }));
+  const current = refMap.get("refs/heads/main");
+  if (current !== fork && current !== commit) {
+    throw new Error("main changed during the build; rerun with the latest main");
+  }
+  const existingTag = refMap.get(`refs/tags/${tag}`);
+  if (!published && existingTag && existingTag !== commit) {
+    throw new Error(`Refusing to overwrite existing tag ${tag}`);
+  }
+  // 先校验祖先关系，再以精确 lease 防止检查后 main 被并发更新；新 tag 一起原子推送。
+  await git(source, ["push", "--atomic", `--force-with-lease=refs/heads/main:${current}`,
+    remote, `${commit}:refs/heads/main`, ...(!published ? [`${commit}:refs/tags/${tag}`] : [])], env);
 }
 
 async function syncSource(destination) {
@@ -69,7 +126,9 @@ async function syncSource(destination) {
   const mise = await readFile(resolve(source, "mise.toml"), "utf8");
   const node = mise.match(/^node\s*=\s*"([^"]+)"/m)?.[1];
   if (!node) throw new Error("Missing pinned Node version in mise.toml");
-  await output({ tag, upstream, fork, node });
+  const synced = await git(root, ["merge-base", "--is-ancestor", upstream, fork])
+    .then(() => pkg.version === version, () => false);
+  await output({ tag, upstream, fork, node, synced });
 }
 
 export async function validateManifest(directory, manifest, tag) {
@@ -97,8 +156,17 @@ export async function validateManifest(directory, manifest, tag) {
 }
 
 async function main() {
-  const [command, directory, tag] = process.argv.slice(2);
+  const [command, directory, tag, fork, upstream] = process.argv.slice(2);
   if (command === "sync" && directory) return syncSource(directory);
+  if (command === "snapshot" && directory && tag && fork && upstream) {
+    const commit = await snapshotSource({ source: resolve(directory), tag, fork, upstream });
+    await output({ commit });
+    return;
+  }
+  if (command === "push-verified" && directory && tag && fork && upstream) {
+    return pushVerifiedSource({ source: resolve(directory), tag, fork, commit: upstream,
+      published: process.env.RELEASE_PUBLISHED === "true" });
+  }
   if (command === "validate" && directory && tag) {
     const { parse } = await import("yaml");
     const manifest = parse(await readFile(resolve(directory, "latest.yml"), "utf8"));
@@ -106,7 +174,7 @@ async function main() {
     await writeFile(resolve(directory, "release-assets.txt"), assets.join("\n") + "\n");
     return;
   }
-  throw new Error("Usage: upstream-release.mjs sync <worktree> | validate <dist> <tag>");
+  throw new Error("Usage: upstream-release.mjs sync <worktree> | snapshot <worktree> <tag> <fork> <upstream> | push-verified <worktree> <tag> <fork> <commit> | validate <dist> <tag>");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await main();
