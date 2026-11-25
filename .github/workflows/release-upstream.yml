@@ -134,6 +134,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.source.outputs.tag }}
           FORK_SHA: ${{ steps.source.outputs.fork }}
+          ZCODE_AFFECTED_TEST_BASE: ${{ steps.source.outputs.fork }}
           SOURCE_SHA: ${{ steps.snapshot.outputs.commit }}
           RELEASE_PUBLISHED: ${{ steps.existing.outputs.published }}
         run: node scripts/ci/upstream-release.mjs push-verified "${{ github.workspace }}/build-source" "$env:RELEASE_TAG" "$env:FORK_SHA" "$env:SOURCE_SHA"
